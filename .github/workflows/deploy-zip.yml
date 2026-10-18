@@ -1,0 +1,101 @@
+name: ZIP upgrade and explicit Pages deployment
+
+on:
+  push:
+    branches: [main]
+    paths: ['Gyan Tools-Business-Re ady-Update.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-zip-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate exactly one ZIP and safely extract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, zipfile, shutil, stat
+          root=pathlib.Path('.')
+          zips=list(root.glob('*.zip'))
+          if len(zips)!=1 or zips[0].name!='site.zip':
+              raise SystemExit('Upload exactly one root ZIP named site.zip; remove other root ZIPs first.')
+          stage=root/'_site'
+          if stage.exists(): shutil.rmtree(stage)
+          stage.mkdir()
+          with zipfile.ZipFile(zips[0]) as z:
+              entries=z.infolist()
+              if len(entries)>20000 or sum(e.file_size for e in entries)>64*1024*1024:
+                  raise SystemExit('Archive exceeds extraction budget.')
+              for e in entries:
+                  p=pathlib.PurePosixPath(e.filename)
+                  if p.is_absolute() or '..' in p.parts or '\\' in e.filename or stat.S_ISLNK(e.external_attr>>16):
+                      raise SystemExit('Unsafe ZIP path/type: '+e.filename)
+                  if p.parts and p.parts[0] in {'.git','.github','CNAME'}:
+                      raise SystemExit('Protected path in payload: '+e.filename)
+              z.extractall(stage)
+          if not (stage/'index.html').is_file() or not (stage/'.nojekyll').is_file():
+              raise SystemExit('ZIP must be root-flat and contain index.html plus .nojekyll.')
+          if len(list(stage.rglob('*.html')))<190:
+              raise SystemExit('Expected full-site archive with all legacy routes.')
+          # Preserve the supplied sitemap; do not pretend every old article was updated today.
+          import xml.etree.ElementTree as ET
+          from urllib.parse import urlparse, unquote
+          urls=[n.text for n in ET.parse(stage/'sitemap.xml').getroot().iter() if n.tag.endswith('loc')]
+          if len(urls)<180: raise SystemExit('Unexpectedly small sitemap.')
+          for url in urls:
+              parsed=urlparse(url)
+              if parsed.netloc!='gyantools.github.io': raise SystemExit('Unexpected sitemap host: '+url)
+              rel=unquote(parsed.path).lstrip('/') or 'index.html'
+              if '..' in pathlib.PurePosixPath(rel).parts or not (stage/rel).is_file():
+                  raise SystemExit('Missing/unsafe sitemap URL: '+url)
+          # Protect repository internals, existing custom domain and root verification files.
+          for p in root.iterdir():
+              if p.name in {'.git','.github','CNAME','_site','site.zip'} or (p.name.startswith('google') and p.suffix=='.html'):
+                  continue
+              if p.is_dir(): shutil.rmtree(p)
+              else: p.unlink()
+          for p in stage.iterdir():
+              dest=root/p.name
+              if p.is_dir(): shutil.copytree(p,dest,dirs_exist_ok=True)
+              else: shutil.copy2(p,dest)
+          shutil.rmtree(stage)
+          (root/'site.zip').unlink()
+          print('Validated and installed',len(urls),'sitemap URLs.')
+          PY
+
+      - name: Commit installed files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Install validated GyanTools ZIP release [skip ci]"
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+      - name: Prepare public artifact without repository internals
+        shell: bash
+        run: |
+          mkdir -p /tmp/gyantools-pages
+          rsync -a --exclude='.git' --exclude='.github' --exclude='*.zip' ./ /tmp/gyantools-pages/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: /tmp/gyantools-pages
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
