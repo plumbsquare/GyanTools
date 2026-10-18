@@ -1,0 +1,213 @@
+
+name: GyanTools ZIP Validation and Pages Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - site.zip and other 
+      - .github/workflows/website-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate and safely extract ZIP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import zipfile
+          import shutil
+          import stat
+          import xml.etree.ElementTree as ET
+          from urllib.parse import urlparse, unquote
+          from pathlib import PurePosixPath
+
+          root = pathlib.Path(".")
+          archive = root / "site.zip"
+          stage = root / "_site"
+
+          if not archive.is_file():
+              raise SystemExit("Missing root-level site.zip")
+
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir()
+
+          with zipfile.ZipFile(archive) as z:
+              entries = z.infolist()
+
+              if len(entries) > 20000:
+                  raise SystemExit("Too many ZIP entries")
+
+              if sum(e.file_size for e in entries) > 64 * 1024 * 1024:
+                  raise SystemExit("ZIP exceeds 64 MiB extracted size")
+
+              seen = set()
+              top = set()
+
+              for e in entries:
+                  name = e.filename
+                  p = PurePosixPath(name)
+
+                  if (not name or "\x00" in name or "\\" in name
+                      or p.is_absolute() or ".." in p.parts
+                      or (p.parts and ":" in p.parts[0])):
+                      raise SystemExit("Unsafe ZIP path: " + repr(name))
+
+                  if e.flag_bits & 1:
+                      raise SystemExit("Encrypted ZIP entries are not allowed")
+
+                  if stat.S_ISLNK(e.external_attr >> 16):
+                      raise SystemExit("Symlinks are not allowed: " + name)
+
+                  clean = name.rstrip("/")
+                  if not clean:
+                      continue
+
+                  if clean in seen:
+                      raise SystemExit("Duplicate ZIP path: " + clean)
+                  seen.add(clean)
+                  top.add(PurePosixPath(clean).parts[0])
+
+              names = {e.filename.rstrip("/") for e in entries}
+              prefix = None
+
+              if "index.html" not in names:
+                  if len(top) != 1:
+                      raise SystemExit(
+                          "ZIP must contain index.html at root "
+                          "or inside one top-level folder"
+                      )
+                  prefix = next(iter(top))
+                  if prefix + "/index.html" not in names:
+                      raise SystemExit("No index.html found in ZIP")
+
+              installed = set()
+
+              for e in entries:
+                  p = PurePosixPath(e.filename.rstrip("/"))
+                  if not p.parts:
+                      continue
+
+                  parts = p.parts
+                  if prefix is not None:
+                      if parts[0] != prefix:
+                          raise SystemExit("Unexpected path outside ZIP folder")
+                      parts = parts[1:]
+
+                  if not parts:
+                      continue
+
+                  rel = PurePosixPath(*parts)
+                  name = rel.as_posix()
+
+                  if (parts[0] in {".git", ".github"}
+                      or name == "CNAME"
+                      or name == "site.zip"
+                      or (len(parts) == 1
+                          and name.startswith("google")
+                          and name.endswith(".html"))):
+                      raise SystemExit("Protected path in ZIP: " + name)
+
+                  if name in installed:
+                      raise SystemExit("Duplicate extracted path: " + name)
+                  installed.add(name)
+
+                  if e.is_dir():
+                      (stage / pathlib.Path(*parts)).mkdir(
+                          parents=True, exist_ok=True
+                      )
+                      continue
+
+                  target = stage / pathlib.Path(*parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+
+                  with z.open(e) as src, target.open("wb") as dst:
+                      shutil.copyfileobj(src, dst)
+
+          if not (stage / "index.html").is_file():
+              raise SystemExit("Missing root index.html")
+
+          if len(list(stage.rglob("*.html"))) < 190:
+              raise SystemExit("Expected full-site archive with 190+ HTML pages")
+
+          sitemap = stage / "sitemap.xml"
+          if not sitemap.is_file():
+              raise SystemExit("Missing sitemap.xml")
+
+          urls = [
+              node.text.strip()
+              for node in ET.parse(sitemap).getroot().iter()
+              if node.tag.endswith("loc") and node.text
+          ]
+
+          if len(urls) < 180:
+              raise SystemExit("Unexpectedly small sitemap")
+
+          for url in urls:
+              parsed = urlparse(url)
+              if (parsed.scheme != "https"
+                  or parsed.netloc != "gyantools.github.io"):
+                  raise SystemExit("Unexpected sitemap URL: " + url)
+
+              rel = unquote(parsed.path).lstrip("/") or "index.html"
+              path = PurePosixPath(rel)
+
+              if "\\" in rel or ".." in path.parts:
+                  raise SystemExit("Unsafe sitemap path: " + url)
+
+              target = stage / pathlib.Path(*path.parts)
+
+              if rel.endswith("/"):
+                  target = target / "index.html"
+
+              if not target.is_file():
+                  raise SystemExit("Sitemap file missing: " + url)
+
+          # Keep repository-owned domain and verification files.
+          for pattern in ("google*.html",):
+              for source in root.glob(pattern):
+                  if source.is_file() and not (stage / source.name).exists():
+                      shutil.copy2(source, stage / source.name)
+
+          cname = root / "CNAME"
+          if cname.is_file() and not (stage / "CNAME").exists():
+              shutil.copy2(cname, stage / "CNAME")
+
+          (stage / ".nojekyll").touch(exist_ok=True)
+
+          print("ZIP validation passed.")
+          print("HTML pages:", len(list(stage.rglob("*.html"))))
+          print("Sitemap URLs:", len(urls))
+          PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload validated website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
